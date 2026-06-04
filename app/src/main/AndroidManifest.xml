@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Necesario para enumerar todas las apps instaladas en Android 11+ y poder
+         detectar apps ocultas/sospechosas. Correcto para una app de auditoría sideloaded. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
     <!-- Visibilidad de paquetes (Android 11+): permite ver y lanzar el updater
          del sistema (en OEMs como Motorola vive en un paquete aparte). -->
@@ -27,6 +33,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".AppListActivity"
+            android:exported="false" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

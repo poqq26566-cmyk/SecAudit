@@ -5,9 +5,7 @@ import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
-import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -24,57 +22,85 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
+import java.security.KeyStore
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
 /**
- * Auditor de seguridad del dispositivo. Agrupa los hallazgos en categorías
- * (Sistema, Desarrollador, Conectividad), calcula un puntaje 0-100, ofrece un
- * botón "Solucionar" hacia los Ajustes pertinentes en cada alerta resoluble, y
- * permite exportar un informe HTML.
- *
- * Nota: la detección de SELinux interpreta el "permiso denegado" al leer
- * /sys/fs/selinux/enforce como prueba de ENFORCING (en permissive la lectura no
- * se bloquearía), evitando el falso negativo clásico.
+ * Auditor de seguridad del dispositivo: chequeos de Sistema/Desarrollador/Conectividad/
+ * Privacidad (síncronos) + análisis del parque de aplicaciones (asíncrono) buscando apps
+ * ocultas o sospechosas con criterio compuesto. Calcula un puntaje 0-100, ofrece botones
+ * "Solucionar" hacia Ajustes y exporta un informe HTML.
  */
-class MainActivity : AppCompatActivity() {
-
-    private enum class Sev { GOOD, WARN, INFO }
+class MainActivity : BaseSecActivity() {
 
     private data class Check(
         val category: String,
         val title: String,
         val sev: Sev,
         val detail: String,
-        val fix: List<Intent> = emptyList()
+        val fix: List<Intent> = emptyList(),
+        val actionLabel: String? = null,
+        val onAction: (() -> Unit)? = null
     )
 
-    private val density by lazy { resources.displayMetrics.density }
-    private fun px(v: Int) = (v * density).toInt()
+    private val allChecks = mutableListOf<Check>()
+    private var scanDone = false
+    private var lastRenderedCategory = ""
 
-    private fun col(id: Int) = ContextCompat.getColor(this, id)
-    private fun sevColor(s: Sev) = when (s) {
-        Sev.GOOD -> col(R.color.good)
-        Sev.WARN -> col(R.color.warn)
-        Sev.INFO -> col(R.color.info)
-    }
+    private lateinit var contentRoot: LinearLayout
+    private lateinit var scoreNumber: TextView
+    private lateinit var scoreSub: TextView
+    private lateinit var barFilled: View
+    private lateinit var barEmpty: View
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val checks = runChecks()
-        setContentView(buildView(checks))
+
+        allChecks.addAll(runDeviceChecks())
+        setContentView(buildBaseUi())
+
+        // Sección de apps: header + placeholder, y escaneo en segundo plano.
+        contentRoot.addView(categoryHeader("Aplicaciones"))
+        lastRenderedCategory = "Aplicaciones"
+        val loading = TextView(this).apply {
+            text = "Analizando aplicaciones…"
+            textSize = 13f
+            setTextColor(col(R.color.textSecondary))
+            setPadding(px(4), px(2), 0, px(4))
+        }
+        contentRoot.addView(loading)
+
+        Executors.newSingleThreadExecutor().execute {
+            val result = AppScanner.scan(this)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                contentRoot.removeView(loading)
+                val appChecks = appSummaryChecks(result)
+                allChecks.addAll(appChecks)
+                for (c in appChecks) {
+                    contentRoot.addView(buildCard(c), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
+                        topMargin = px(10)
+                    })
+                }
+                scanDone = true
+                updateScore()
+            }
+        }
     }
 
-    private fun runChecks(): List<Check> = listOf(
+    private fun runDeviceChecks(): List<Check> = listOf(
         checkRoot(), checkSelinux(), checkEncryption(), checkScreenLock(),
-        checkSecurityPatch(), checkBuildTags(), checkPlayProtect(), infoAndroidVersion(),
-        checkDeveloperOptions(), checkUsbDebugging(), checkAdbBackup(), checkUnknownSources(),
-        checkWifi(), checkBluetooth(), checkNfc()
+        checkSecurityPatch(), checkBuildTags(), checkPlayProtect(), checkPlayProtectVerifier(),
+        infoAndroidVersion(),
+        checkDeveloperOptions(), checkUsbDebugging(), checkAdbWifi(), checkAdbBackup(), checkUnknownSources(),
+        checkWifi(), checkBluetooth(), checkNfc(),
+        checkUserCaCerts(), checkLockScreenNotifications()
     )
 
     // =========================================================== Sistema
@@ -170,8 +196,8 @@ class MainActivity : AppCompatActivity() {
                 "Sistema", "Parche de seguridad", Sev.WARN,
                 "Parche: $patch (hace $days días). El dispositivo puede tener vulnerabilidades sin parchear; actualizá.",
                 fix = listOf(
-                    // El updater del OEM (Motorola) está protegido por permiso de firma y no
-                    // es lanzable; el de Google Play Services sí abre el chequeo de updates.
+                    // El updater del OEM (Motorola) está protegido por permiso de firma y no es
+                    // lanzable; el de Google Play Services sí abre el chequeo de updates.
                     Intent().setClassName("com.google.android.gms", "com.google.android.gms.update.SystemUpdateActivity"),
                     Intent("android.settings.SYSTEM_UPDATE_SETTINGS").setPackage("com.google.android.gms"),
                     Intent("android.settings.SYSTEM_UPDATE_SETTINGS"),
@@ -206,6 +232,19 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun checkPlayProtectVerifier(): Check {
+        var v = Settings.Global.getInt(contentResolver, "package_verifier_enable", -1)
+        if (v == -1) v = Settings.Secure.getInt(contentResolver, "package_verifier_enable", 1)
+        val enabled = v != 0
+        return Check(
+            "Sistema", "Verificador de apps",
+            if (enabled) Sev.GOOD else Sev.WARN,
+            if (enabled) "El verificador de Google (Play Protect) escanea apps al instalarlas."
+            else "El verificador de apps está desactivado: las apps no se escanean al instalar.",
+            fix = if (enabled) emptyList() else listOf(Intent(Settings.ACTION_SECURITY_SETTINGS))
+        )
+    }
+
     private fun infoAndroidVersion(): Check = Check(
         "Sistema", "Versión de Android", Sev.INFO,
         "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) · ${Build.MANUFACTURER} ${Build.MODEL}"
@@ -233,6 +272,17 @@ class MainActivity : AppCompatActivity() {
             if (on) Sev.WARN else Sev.GOOD,
             if (on) "USB debugging ACTIVADO. Desactivalo si no lo necesitás." else "USB debugging desactivado.",
             fix = listOf(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+        )
+    }
+
+    private fun checkAdbWifi(): Check {
+        val on = Settings.Global.getInt(contentResolver, "adb_wifi_enabled", 0) == 1
+        return Check(
+            "Desarrollador", "ADB por WiFi",
+            if (on) Sev.WARN else Sev.GOOD,
+            if (on) "Depuración inalámbrica activada: el dispositivo es accesible por ADB en la red local."
+            else "Depuración inalámbrica desactivada.",
+            fix = if (on) listOf(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) else emptyList()
         )
     }
 
@@ -307,32 +357,129 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ========================================================= Privacidad
+
+    private fun checkUserCaCerts(): Check {
+        val userAliases = try {
+            val ks = KeyStore.getInstance("AndroidCAStore")
+            ks.load(null)
+            Collections.list(ks.aliases()).filter { it.startsWith("user:") }
+        } catch (_: Exception) { emptyList() }
+        return if (userAliases.isEmpty())
+            Check("Privacidad", "Certificados CA de usuario", Sev.GOOD,
+                "Sin certificados raíz agregados por el usuario. El tráfico TLS no es interceptable por CAs externas.")
+        else
+            Check("Privacidad", "Certificados CA de usuario", Sev.WARN,
+                "${userAliases.size} certificado(s) raíz agregados por el usuario o una empresa. " +
+                    "Pueden permitir interceptar tráfico HTTPS (MITM). Revisalos si no los reconocés.",
+                fix = listOf(Intent(Settings.ACTION_SECURITY_SETTINGS)))
+    }
+
+    private fun checkLockScreenNotifications(): Check {
+        val show = Settings.Secure.getInt(contentResolver, "lock_screen_show_notifications", 1)
+        val priv = Settings.Secure.getInt(contentResolver, "lock_screen_allow_private_notifications", 1)
+        val notifFix = listOf(
+            Intent("android.settings.NOTIFICATION_SETTINGS"),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        return when {
+            show == 0 -> Check("Privacidad", "Notif. en pantalla bloqueada", Sev.GOOD,
+                "Las notificaciones no se muestran con el teléfono bloqueado.")
+            priv == 1 -> Check("Privacidad", "Notif. en pantalla bloqueada", Sev.WARN,
+                "El contenido de las notificaciones (incluidos códigos 2FA) es visible con el teléfono bloqueado.",
+                fix = notifFix)
+            else -> Check("Privacidad", "Notif. en pantalla bloqueada", Sev.GOOD,
+                "Se muestran notificaciones pero con el contenido sensible oculto en el bloqueo.")
+        }
+    }
+
+    // ====================================================== Resumen apps
+
+    private fun appSummaryChecks(r: ScanResult): List<Check> {
+        val out = ArrayList<Check>()
+        val n = r.flagged.size
+        out.add(Check(
+            "Aplicaciones", "Apps sospechosas",
+            if (n > 0) Sev.WARN else Sev.GOOD,
+            if (n > 0) "$n app(s) combinan señales de riesgo (sobre ${r.totalUserApps} de usuario). Revisalas una por una."
+            else "Ninguna app combina señales de riesgo (sobre ${r.totalUserApps} apps de usuario).",
+            actionLabel = if (n > 0) "Ver apps marcadas ($n)" else null,
+            onAction = if (n > 0) ({ startActivity(Intent(this, AppListActivity::class.java)) }) else null
+        ))
+        out.add(Check(
+            "Aplicaciones", "Apps ocultas",
+            when {
+                r.hiddenRisky -> Sev.WARN          // oculta + origen no confiable = patrón de spyware
+                r.hidden.isNotEmpty() -> Sev.INFO  // suelen ser componentes del sistema sin lanzador
+                else -> Sev.GOOD
+            },
+            if (r.hidden.isNotEmpty())
+                "${r.hidden.size} app(s) de usuario sin ícono en el cajón: ${r.hidden.joinToString(", ") { it.label }}. " +
+                    "Sin ícono puede ser un componente legítimo o spyware que se esconde; revisá las que no reconozcas."
+            else "Todas las apps de usuario tienen ícono visible."
+        ))
+        out.add(Check(
+            "Aplicaciones", "Servicios de accesibilidad",
+            if (r.accessibility.isNotEmpty()) Sev.WARN else Sev.GOOD,
+            if (r.accessibility.isNotEmpty())
+                "Apps con accesibilidad (pueden leer la pantalla y simular toques): ${r.accessibility.joinToString(", ")}."
+            else "Ninguna app de terceros usa accesibilidad.",
+            fix = if (r.accessibility.isNotEmpty()) listOf(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) else emptyList()
+        ))
+        out.add(Check(
+            "Aplicaciones", "Acceso a notificaciones",
+            if (r.notifListeners.isNotEmpty()) Sev.WARN else Sev.GOOD,
+            if (r.notifListeners.isNotEmpty())
+                "Apps que leen todas las notificaciones (incluidos códigos 2FA): ${r.notifListeners.joinToString(", ")}."
+            else "Ninguna app de terceros lee tus notificaciones.",
+            fix = if (r.notifListeners.isNotEmpty())
+                listOf(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")) else emptyList()
+        ))
+        out.add(Check(
+            "Aplicaciones", "Administradores de dispositivo",
+            if (r.deviceAdmins.isNotEmpty()) Sev.WARN else Sev.GOOD,
+            if (r.deviceAdmins.isNotEmpty())
+                "Apps con admin de dispositivo (resisten desinstalación): ${r.deviceAdmins.joinToString(", ")}."
+            else "Ninguna app de terceros es administrador del dispositivo.",
+            fix = if (r.deviceAdmins.isNotEmpty()) listOf(Intent(Settings.ACTION_SECURITY_SETTINGS)) else emptyList()
+        ))
+        out.add(Check(
+            "Aplicaciones", "Apps fuera de Play Store", Sev.INFO,
+            "${r.sideloadedCount} app(s) instaladas fuera de Google Play. No es malo en sí, pero es la vía habitual del malware."
+        ))
+        return out
+    }
+
     // ================================================================ UI
 
-    private fun rounded(fill: Int, radius: Int, strokeColor: Int = 0, strokeW: Int = 0) =
-        GradientDrawable().apply {
-            setColor(fill)
-            cornerRadius = radius.toFloat()
-            if (strokeW > 0) setStroke(strokeW, strokeColor)
-        }
-
-    private fun buildView(checks: List<Check>): View {
-        val good = checks.count { it.sev == Sev.GOOD }
-        val scorable = checks.count { it.sev != Sev.INFO }
+    private fun computeScore(): Triple<Int, Int, Int> {
+        val good = allChecks.count { it.sev == Sev.GOOD }
+        val scorable = allChecks.count { it.sev != Sev.INFO }
         val score = if (scorable == 0) 100 else (good * 100) / scorable
-        val scoreColor = when {
-            score >= 80 -> col(R.color.good)
-            score >= 50 -> col(R.color.warn)
-            else -> col(R.color.warn)
-        }
+        return Triple(score, good, scorable)
+    }
 
-        val root = LinearLayout(this).apply {
+    private fun scoreColor(score: Int) = if (score >= 80) col(R.color.good) else col(R.color.warn)
+
+    private fun categoryHeader(name: String) = TextView(this).apply {
+        text = name.uppercase(Locale.getDefault())
+        textSize = 12f
+        letterSpacing = 0.12f
+        setTextColor(col(R.color.accent))
+        setTypeface(typeface, Typeface.BOLD)
+        setPadding(px(4), px(22), 0, px(8))
+    }
+
+    private fun buildBaseUi(): View {
+        val (score, good, scorable) = computeScore()
+
+        contentRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(px(18), px(22), px(18), px(28))
         }
 
-        // -------- Encabezado: escudo + título --------
-        root.addView(LinearLayout(this).apply {
+        // Encabezado
+        contentRoot.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(ImageView(this@MainActivity).apply {
@@ -355,21 +502,29 @@ class MainActivity : AppCompatActivity() {
             })
         })
 
-        // -------- Tarjeta de puntaje con barra --------
-        root.addView(LinearLayout(this).apply {
+        // Tarjeta de puntaje
+        scoreNumber = TextView(this).apply {
+            text = "$score"
+            textSize = 44f
+            setTextColor(scoreColor(score))
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        barFilled = View(this).apply { background = rounded(scoreColor(score), px(6)) }
+        barEmpty = View(this)
+        scoreSub = TextView(this).apply {
+            text = "$good de $scorable controles superados"
+            textSize = 13f
+            setTextColor(col(R.color.textSecondary))
+            setPadding(0, px(10), 0, 0)
+        }
+        contentRoot.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded(col(R.color.surface), px(18), col(R.color.stroke), px(1))
             setPadding(px(20), px(18), px(20), px(18))
-            // número + texto
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.BOTTOM
-                addView(TextView(this@MainActivity).apply {
-                    text = "$score"
-                    textSize = 44f
-                    setTextColor(scoreColor)
-                    setTypeface(typeface, Typeface.BOLD)
-                })
+                addView(scoreNumber)
                 addView(TextView(this@MainActivity).apply {
                     text = " / 100"
                     textSize = 16f
@@ -377,49 +532,48 @@ class MainActivity : AppCompatActivity() {
                     setPadding(px(4), 0, 0, px(8))
                 })
             })
-            // barra de progreso
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 background = rounded(col(R.color.bg), px(6))
-                addView(View(this@MainActivity).apply {
-                    background = rounded(scoreColor, px(6))
-                }, LinearLayout.LayoutParams(0, px(8), score.toFloat().coerceAtLeast(1f)))
-                addView(View(this@MainActivity), LinearLayout.LayoutParams(0, px(8), (100 - score).toFloat()))
+                addView(barFilled, LinearLayout.LayoutParams(0, px(8), score.toFloat().coerceAtLeast(1f)))
+                addView(barEmpty, LinearLayout.LayoutParams(0, px(8), (100 - score).toFloat()))
             }, LinearLayout.LayoutParams(MATCH_PARENT, px(8)).apply { topMargin = px(12) })
-            addView(TextView(this@MainActivity).apply {
-                text = "$good de $scorable controles superados"
-                textSize = 13f
-                setTextColor(col(R.color.textSecondary))
-                setPadding(0, px(10), 0, 0)
-            })
-            // botón compartir informe
-            addView(makeButton("Compartir informe", filled = true) { exportReport(checks, score, good, scorable) },
+            addView(scoreSub)
+            addView(makeButton("Compartir informe", filled = true) { exportReport() },
                 LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = px(14) })
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = px(18) })
 
-        // -------- Checks por categoría --------
-        var lastCategory = ""
-        for (c in checks) {
-            if (c.category != lastCategory) {
-                lastCategory = c.category
-                root.addView(TextView(this).apply {
-                    text = c.category.uppercase(Locale.getDefault())
-                    textSize = 12f
-                    letterSpacing = 0.12f
-                    setTextColor(col(R.color.accent))
-                    setTypeface(typeface, Typeface.BOLD)
-                    setPadding(px(4), px(22), 0, px(8))
-                })
-            }
-            root.addView(buildCard(c), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
-                topMargin = px(10)
-            })
-        }
+        // Chequeos de dispositivo (síncronos)
+        renderChecks(allChecks)
 
         return ScrollView(this).apply {
             isFillViewport = true
-            addView(root)
+            addView(contentRoot)
         }
+    }
+
+    private fun renderChecks(list: List<Check>) {
+        for (c in list) {
+            if (c.category != lastRenderedCategory) {
+                lastRenderedCategory = c.category
+                contentRoot.addView(categoryHeader(c.category))
+            }
+            contentRoot.addView(buildCard(c), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
+                topMargin = px(10)
+            })
+        }
+    }
+
+    private fun updateScore() {
+        val (score, good, scorable) = computeScore()
+        scoreNumber.text = "$score"
+        scoreNumber.setTextColor(scoreColor(score))
+        scoreSub.text = "$good de $scorable controles superados"
+        barFilled.background = rounded(scoreColor(score), px(6))
+        (barFilled.layoutParams as LinearLayout.LayoutParams).weight = score.toFloat().coerceAtLeast(1f)
+        (barEmpty.layoutParams as LinearLayout.LayoutParams).weight = (100 - score).toFloat()
+        barFilled.requestLayout()
+        barEmpty.requestLayout()
     }
 
     private fun buildCard(c: Check): View {
@@ -428,7 +582,6 @@ class MainActivity : AppCompatActivity() {
             background = rounded(col(R.color.surface), px(16), sevColor(c.sev) and 0x55FFFFFF.toInt(), px(1))
             setPadding(px(16), px(14), px(16), px(14))
         }
-        // header: dot + título + chip
         card.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -457,8 +610,13 @@ class MainActivity : AppCompatActivity() {
             setLineSpacing(px(2).toFloat(), 1f)
             setPadding(px(19), px(7), 0, 0)
         })
-        if (c.sev == Sev.WARN && c.fix.isNotEmpty()) {
-            card.addView(makeButton("Solucionar  ›", filled = false) { launchFix(c.fix) },
+        if (c.onAction != null && c.actionLabel != null) {
+            card.addView(makeButton(c.actionLabel, filled = true) { c.onAction.invoke() },
+                LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+                    topMargin = px(12); leftMargin = px(19)
+                })
+        } else if (c.sev == Sev.WARN && c.fix.isNotEmpty()) {
+            card.addView(makeButton("Solucionar  ›", filled = false) { launchFirst(c.fix) },
                 LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
                     topMargin = px(10); leftMargin = px(19)
                 })
@@ -466,39 +624,17 @@ class MainActivity : AppCompatActivity() {
         return card
     }
 
-    /** Botón estilizado (sin XML): relleno acento o contorno. */
-    private fun makeButton(label: String, filled: Boolean, onClick: () -> Unit): View =
-        TextView(this).apply {
-            text = label
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setTypeface(typeface, Typeface.BOLD)
-            isClickable = true
-            setPadding(px(20), px(12), px(20), px(12))
-            if (filled) {
-                setTextColor(Color.parseColor("#0D1117"))
-                background = rounded(col(R.color.accent), px(12))
-            } else {
-                setTextColor(col(R.color.accent))
-                background = rounded(Color.TRANSPARENT, px(12), col(R.color.accent), px(1))
-            }
-            setOnClickListener { onClick() }
-        }
-
-    /** Prueba cada intent candidato hasta que uno abra; si ninguno, abre Ajustes general. */
-    private fun launchFix(candidates: List<Intent>) {
-        for (i in candidates) {
-            try { startActivity(i); return } catch (_: Exception) { /* probar el siguiente */ }
-        }
-        try { startActivity(Intent(Settings.ACTION_SETTINGS)) } catch (_: Exception) {}
-    }
-
     // ------------------------------------------------------- Informe HTML
 
-    private fun exportReport(checks: List<Check>, score: Int, good: Int, scorable: Int) {
+    private fun exportReport() {
+        if (!scanDone) {
+            Toast.makeText(this, "Analizando aplicaciones, probá en unos segundos…", Toast.LENGTH_SHORT).show()
+            return
+        }
         try {
+            val (score, good, scorable) = computeScore()
             val now = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
-            val scoreHex = when { score >= 80 -> "#3FB950"; else -> "#F85149" }
+            val scoreHex = if (score >= 80) "#3FB950" else "#F85149"
             val sb = StringBuilder()
             sb.append(
                 "<!DOCTYPE html><html lang='es'><head><meta charset='utf-8'>" +
@@ -521,7 +657,7 @@ class MainActivity : AppCompatActivity() {
             sb.append("<div class='sub'>$good de $scorable controles superados</div>")
 
             var lastCat = ""
-            for (c in checks) {
+            for (c in allChecks) {
                 if (c.category != lastCat) {
                     lastCat = c.category
                     sb.append("<div class='cat'>${c.category.uppercase(Locale.getDefault())}</div>")
