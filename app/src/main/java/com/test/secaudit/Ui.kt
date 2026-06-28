@@ -12,8 +12,8 @@ import androidx.core.content.ContextCompat
 enum class Sev { GOOD, WARN, INFO }
 
 /**
- * Base with UI helpers (dark style, no XML) reused by MainActivity and AppListActivity:
- * dp→px conversion, colors, rounded backgrounds and buttons.
+ * 包含 UI 辅助方法的基类（深色风格，无 XML），供 MainActivity 和 AppListActivity 复用：
+ * dp→px 转换、颜色、圆角背景和按钮。
  */
 abstract class BaseSecActivity : AppCompatActivity() {
 
@@ -35,7 +35,7 @@ abstract class BaseSecActivity : AppCompatActivity() {
             if (strokeW > 0) setStroke(strokeW, strokeColor)
         }
 
-    /** Styled button (no XML): filled accent or outline. */
+    /** 样式化按钮（无 XML）：填充色或描边。 */
     protected fun makeButton(label: String, filled: Boolean, onClick: () -> Unit): View =
         TextView(this).apply {
             text = label
@@ -54,10 +54,10 @@ abstract class BaseSecActivity : AppCompatActivity() {
             setOnClickListener { onClick() }
         }
 
-    /** Launches the first intent that resolves; falls back to general Settings. */
+    /** 启动第一个可解析的 Intent；如果都失败则回退到通用设置。 */
     protected fun launchFirst(candidates: List<android.content.Intent>) {
         for (i in candidates) {
-            try { startActivity(i); return } catch (_: Exception) { /* try next */ }
+            try { startActivity(i); return } catch (_: Exception) { /* 尝试下一个 */ }
         }
         try { startActivity(android.content.Intent(android.provider.Settings.ACTION_SETTINGS)) } catch (_: Exception) {}
     }
