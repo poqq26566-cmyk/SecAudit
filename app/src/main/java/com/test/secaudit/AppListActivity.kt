@@ -16,8 +16,8 @@ import android.widget.TextView
 import java.util.concurrent.Executors
 
 /**
- * Dedicated screen: lists apps flagged as risky (score >= 3) with their reasons
- * and actions to review/uninstall them. Scans in background.
+ * 专用界面：列出被标记为高风险（评分 >= 3）的应用及其原因
+ * 并提供查看/卸载操作。后台扫描。
  */
 class AppListActivity : BaseSecActivity() {
 
@@ -34,13 +34,13 @@ class AppListActivity : BaseSecActivity() {
         setContentView(ScrollView(this).apply { isFillViewport = true; addView(container) })
 
         container.addView(TextView(this).apply {
-            text = "Flagged Apps"
+            text = "被标记的应用"
             textSize = 24f
             setTextColor(col(R.color.textPrimary))
             setTypeface(typeface, Typeface.BOLD)
         })
         val loading = TextView(this).apply {
-            text = "Analyzing apps…"
+            text = "正在分析应用…"
             textSize = 14f
             setTextColor(col(R.color.textSecondary))
             setPadding(0, px(16), 0, 0)
@@ -60,10 +60,9 @@ class AppListActivity : BaseSecActivity() {
     private fun render(result: ScanResult) {
         container.addView(TextView(this).apply {
             text = if (result.flagged.isEmpty())
-                "No suspicious apps detected among ${result.totalUserApps} user apps."
+                "在 ${result.totalUserApps} 个用户应用中未发现可疑应用。"
             else
-                "${result.flagged.size} of ${result.totalUserApps} user apps flagged. " +
-                    "Review each one; the risk score is a hint, not a malware verdict."
+                "在 ${result.totalUserApps} 个用户应用中标记了 ${result.flagged.size} 个。请逐个审查；风险评分仅供参考，并非恶意软件判定。"
             textSize = 13f
             setTextColor(col(R.color.textSecondary))
             setPadding(0, px(6), 0, px(8))
@@ -84,7 +83,7 @@ class AppListActivity : BaseSecActivity() {
             setPadding(px(16), px(14), px(16), px(14))
         }
 
-        // Header: nombre + chip nivel
+        // 标题：应用名 + 风险等级
         card.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -95,7 +94,7 @@ class AppListActivity : BaseSecActivity() {
                 setTypeface(typeface, Typeface.BOLD)
             }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             addView(TextView(this@AppListActivity).apply {
-                text = if (app.high) "HIGH" else "MEDIUM"
+                text = if (app.high) "高危" else "中危"
                 textSize = 11f
                 setTypeface(typeface, Typeface.BOLD)
                 setTextColor(accent)
@@ -110,7 +109,7 @@ class AppListActivity : BaseSecActivity() {
             setPadding(0, px(2), 0, px(8))
         })
 
-        // Motivos
+        // 原因列表
         for (r in app.reasons) {
             card.addView(TextView(this).apply {
                 text = "•  ${r.text}"
@@ -121,12 +120,12 @@ class AppListActivity : BaseSecActivity() {
             })
         }
 
-        // Acciones
+        // 操作按钮
         card.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, px(10), 0, 0)
-            addView(makeButton("App info", filled = false) { openAppInfo(app.pkg) })
-            addView(makeButton("Uninstall", filled = false) { uninstall(app.pkg) },
+            addView(makeButton("应用信息", filled = false) { openAppInfo(app.pkg) })
+            addView(makeButton("卸载", filled = false) { uninstall(app.pkg) },
                 LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = px(10) })
         })
         return card
